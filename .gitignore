@@ -1,2 +1,58 @@
-# deps
+# 依赖
 node_modules/
+.pnp
+.pnp.js
+
+# 构建输出
+dist/
+build/
+*.tsbuildinfo
+
+# 日志
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# 环境变量
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp
+.cache/
+
+# 测试覆盖率
+coverage/
+.nyc_output/
+
+# Bun
+.bun/
+# bun.lockb 应该提交到版本控制中，以确保依赖版本一致性
+# bun.lockb
+
+# TypeScript
+*.tsbuildinfo
+
+# 其他
+*.pid
+*.seed
+*.pid.lock

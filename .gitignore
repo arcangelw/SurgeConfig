@@ -56,3 +56,6 @@ coverage/
 *.pid
 *.seed
 *.pid.lock
+
+# 敏感配置 (用户私有数据)
+src/secrets.ts

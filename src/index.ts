@@ -5,13 +5,26 @@
  * - 从多个远程 Surge/Shadowrocket 订阅中提取 [Proxy] 段，统一合并。
  * - 根据本地定义的规则与基础配置，动态生成完整的 Surge 配置文件。
  * - 为 Mac（Surge 6）和 iOS（Surge 5）分别提供订阅入口。
+ *
+ * 路由模式：
+ * - Profile Mode (/profile/*): 解析节点模式，从订阅下载并解析节点
+ * - Provider Mode (/provider/*): 外部节点模式，使用 policy-path 自动更新
+ * - Legacy Mode (/*.conf): 兼容旧版端点
  */
 import { env } from 'bun'
 import { Hono } from 'hono'
 import { parse } from 'ini'
-import { kDNS, kRuleSet, kRules, kCustomRules, kSettingMac, kSettingIOS, kSurgeConfig, kGatewayHttpPort, kLanConfig, kLocalLanRules, kExtendedConfig, kRegionConfig } from './config'
+import { kDNS, kRuleSet, kRules, kCustomRules, kSettingMac, kSettingIOS, kSurgeConfig, kGatewayHttpPort, kLanConfig, kLocalLanRules, kExtendedConfig, kRegionConfig } from './config/index'
+
+// 导入新路由模块
+import profileRoutes from './routes/profile'
+import providerRoutes from './routes/provider'
 
 const app = new Hono()
+
+// 注册新路由
+app.route('/profile', profileRoutes)
+app.route('/provider', providerRoutes)
 
 /**
  * 下载远程配置
@@ -111,7 +124,7 @@ const _buildProxy = (proxy: Array<[string, string]>): string => {
  */
 const _bucketProxyByRegion = (proxyNames: string[]): Record<string, string[]> => {
   const buckets: Record<string, string[]> = {}
-  
+
   // 初始化所有地区的桶
   for (const regionKey of Object.keys(kRegionConfig)) {
     buckets[regionKey] = []
@@ -127,7 +140,7 @@ const _bucketProxyByRegion = (proxyNames: string[]): Record<string, string[]> =>
       for (const pattern of config.matchPatterns) {
         const patternLower = pattern.toLowerCase()
         const patternUpper = pattern.toUpperCase()
-        
+
         // 匹配逻辑：包含关键词或匹配正则（对于 TW 等特殊处理）
         if (
           name.includes(pattern) ||
@@ -168,18 +181,20 @@ const _buildStandardGroups = (
   allNodesName: string,
   excludeHKAndTW: boolean = false,
   isExternalMode: boolean = false,
-  regionGroupNames?: Record<string, { auto?: string, manual?: string }>,
+  regionGroupNames?: Record<string, string[]>,
   regionBuckets?: Record<string, string[]>,
-  ruleName?: string
+  ruleName?: string,
+  extraGroups?: string[]
 ): string[] => {
   // 根据业务类型对基础候选顺序做一点优化
-  const aiRelatedRules = new Set(["OpenAI", "Claude", "Gemini", "Google", "Github", "Microsoft"])
   let baseGroups: string[]
+  const ruleConfig = ruleName ? kRuleSet[ruleName] : undefined
+  const optimizeType = ruleConfig?.optimizeGroup
 
-  if (ruleName && aiRelatedRules.has(ruleName)) {
+  if (optimizeType === "ai") {
     // AI / 开发相关：优先推荐 🎧 Vibe-Coding
     baseGroups = ["🎧 Vibe-Coding", allNodesName, "🌐 全球直连"]
-  } else if (ruleName === "Apple") {
+  } else if (optimizeType === "apple") {
     // Apple：默认优先直连，避免账号 / 区域风控
     baseGroups = ["🌐 全球直连", "🎧 Vibe-Coding", allNodesName]
   } else if (ruleName === "__final__") {
@@ -191,6 +206,12 @@ const _buildStandardGroups = (
   }
 
   const groups: string[] = [...baseGroups]
+
+  // 插入额外分组（例如 "☁️ 订阅来源"）
+  if (extraGroups && extraGroups.length > 0) {
+    groups.push(...extraGroups)
+  }
+
   const sortedRegions = Object.entries(kRegionConfig).sort((a, b) => a[1].order - b[1].order)
 
   // 按配置顺序添加地区组
@@ -200,24 +221,21 @@ const _buildStandardGroups = (
     }
 
     if (isExternalMode) {
-      // 外部节点模式：直接使用配置生成策略组名称
-      const autoGroupName = `${config.emoji} ${config.name}节点`
-      groups.push(autoGroupName)
-      if (config.hasManualGroup) {
-        const manualGroupName = `${config.emoji} ${config.name}-手动`
-        groups.push(manualGroupName)
+      // 外部节点模式：使用传入的 regionGroupNames (包含了细分和聚合组)
+      const names = regionGroupNames?.[regionKey]
+      if (names && names.length > 0) {
+        groups.push(...names)
       }
     } else {
-      // 解析节点模式：从 regionGroupNames 获取，并检查节点是否存在
-      if (regionBuckets && regionBuckets[regionKey]?.length === 0) {
-        continue
-      }
-      const groupNames = regionGroupNames?.[regionKey]
-      if (groupNames?.auto) {
-        groups.push(groupNames.auto)
-      }
-      if (groupNames?.manual) {
-        groups.push(groupNames.manual)
+      // 解析节点模式：从 regionGroupNames 获取
+      // regionGroupNames 这里已经是适配好的 string[] 数组
+      const names = regionGroupNames?.[regionKey]
+      if (names && names.length > 0) {
+        // 检查是否有节点 (regionBuckets)
+        if (regionBuckets && regionBuckets[regionKey]?.length === 0) {
+          continue
+        }
+        groups.push(...names)
       }
     }
   }
@@ -233,63 +251,165 @@ const _buildStandardGroups = (
  */
 const _buildExternalProxyGroup = (forceExternal: boolean = false): string => {
   let result = ""
-  
+
   // 如果没有配置，返回空字符串
   if (kSurgeConfig.length === 0) {
     return result
   }
-  
-  // 第一个配置作为 "🚀 所有节点" 的基础订阅
-  // 配置名称用于标识，策略组名称统一使用 "🚀 所有节点"
-  const [configName, mainUrl] = kSurgeConfig[0]
-  const allNodesName = "🚀 所有节点"
-  
-  // 添加注释说明这是外部节点配置
+
   if (forceExternal) {
     result += "# > 外部节点\n"
     result += "# 使用 policy-path 自动更新，smart 策略组自动选择最优节点\n\n"
   }
-  
-  // 按配置顺序生成地区策略组
+
+  const allNodesName = "🚀 所有节点"
   const sortedRegions = Object.entries(kRegionConfig).sort((a, b) => a[1].order - b[1].order)
+
+  // 用于收集所有地区的策略组名称（按地区分类），用于传给 _buildStandardGroups
+  const regionAllGroupsMap: Record<string, string[]> = {}
+
+  // 1. 生成 [Region] [Subscription] 颗粒细分策略组 & [Region] 聚合策略组
   const vibeCodingGroups: string[] = []
-  
+
   for (const [regionKey, config] of sortedRegions) {
-    // 生成自动策略组（smart）
-    const autoGroupName = `${config.emoji} ${config.name}节点`
-    result += `# ${config.name}地区自动选择（smart 策略组，自动测速选择最优节点）\n`
-    result += `${autoGroupName} = smart, include-other-group=${allNodesName}, update-interval=0, no-alert=0, hidden=0, include-all-proxies=0, policy-regex-filter=${config.regexFilter}\n`
-    
-    // 只有新加坡和美国添加到 Vibe-Coding
-    if (regionKey === "sg" || regionKey === "us") {
-      vibeCodingGroups.push(autoGroupName)
+    const regionSubGroupsAuto: string[] = []   // 当前地区-订阅-Auto
+    const regionSubGroupsManual: string[] = [] // 当前地区-订阅-Manual
+
+    // 收集该地区所有可用的组（用于业务引用）
+    const regionAllGroups: string[] = []
+
+    // 聚合组名称
+    const regionAggregateName = `${config.emoji} ${config.name}节点` // Auto Aggregate
+    const regionManualName = `${config.emoji} ${config.name}-手动`   // Manual Aggregate
+
+    // 如果是 onlyManual 模式，只生成手动选择组
+    if (config.onlyManual) {
+      // 只生成一个手动选择的聚合组
+      regionAllGroups.push(regionAggregateName)
+
+      const allSubGroups: string[] = []
+      kSurgeConfig.forEach(([subName, subUrl]) => {
+        const subGroupName = `${config.emoji} ${config.name}-${subName}`
+        allSubGroups.push(subGroupName)
+        regionAllGroups.push(subGroupName)
+
+        result += `# ${config.name}地区-${subName}订阅（手动选择）\n`
+        result += `${subGroupName} = select, policy-path=${subUrl}, update-interval=0, no-alert=0, hidden=0, include-all-proxies=0, policy-regex-filter=${config.regexFilter}\n`
+      })
+
+      // 生成手动聚合组
+      result += `# ${config.name}地区聚合（手动选择）\n`
+      result += `${regionAggregateName} = select, ${allSubGroups.join(",")}, update-interval=0, no-alert=0, hidden=0, include-all-proxies=0\n`
+
+      // 保存该地区的所有组列表
+      regionAllGroupsMap[regionKey] = regionAllGroups
+      continue
     }
-    
-    // 如果配置了手动策略组，也生成
+
+    // 正常模式：生成自动和手动策略组
+    // 聚合组排在前面
+    regionAllGroups.push(regionAggregateName)
     if (config.hasManualGroup) {
-      const manualGroupName = `${config.emoji} ${config.name}-手动`
-      result += `# ${config.name}地区手动选择\n`
-      result += `${manualGroupName} = select, include-other-group=${allNodesName}, update-interval=0, no-alert=0, hidden=0, include-all-proxies=0, policy-regex-filter=${config.regexFilter}\n`
-      
-      // 只有新加坡和美国的手动策略组添加到 Vibe-Coding
-      if (regionKey === "sg" || regionKey === "us") {
-        vibeCodingGroups.push(manualGroupName)
+      regionAllGroups.push(regionManualName)
+    }
+
+    // 遍历所有订阅，生成细分策略组
+    kSurgeConfig.forEach(([subName, subUrl]) => {
+      // --- Smart Group (Auto) ---
+      // 命名格式：Emoji RegionName-SubName (紧凑)
+      const subGroupName = `${config.emoji} ${config.name}-${subName}`
+      regionSubGroupsAuto.push(subGroupName)
+      regionAllGroups.push(subGroupName)
+
+      result += `# ${config.name}地区-${subName}订阅\n`
+      result += `${subGroupName} = smart, policy-path=${subUrl}, update-interval=0, no-alert=0, hidden=0, include-all-proxies=0, policy-regex-filter=${config.regexFilter}\n`
+
+      // Vibe-Coding Granular Auto
+      if (config.includeInVibeGroup) {
+        vibeCodingGroups.push(subGroupName)
       }
+
+      // --- Manual Group (Select) ---
+      if (config.hasManualGroup) {
+        const subManualGroupName = `${config.emoji} ${config.name}-${subName}-手动`
+        regionSubGroupsManual.push(subManualGroupName)
+        // regionAllGroups.push(subManualGroupName) // 不再加入业务引用列表 (由聚合组代理)
+
+        result += `# ${config.name}地区-${subName}订阅-手动\n`
+        result += `${subManualGroupName} = select, policy-path=${subUrl}, update-interval=0, no-alert=0, hidden=0, include-all-proxies=0, policy-regex-filter=${config.regexFilter}\n`
+
+        // Vibe-Coding Granular Manual
+        if (config.includeInVibeGroup) {
+          vibeCodingGroups.push(subManualGroupName)
+        }
+      }
+    })
+
+    // --- 生成聚合组 ---
+
+    // 1. Auto Aggregate (Smart/url-test)
+    // 包含所有订阅的 Auto 组
+    result += `# ${config.name}地区聚合（自动选择，包含所有订阅）\n`
+    result += `${regionAggregateName} = url-test, include-other-group="${regionSubGroupsAuto.join(",")}", url=http://www.gstatic.com/generate_204, interval=600, tolerance=100, timeout=5\n`
+
+    // 2. Manual Aggregate (Select)
+    // 包含所有订阅的 Manual 组 (作为二级菜单，直接 Select 订阅 Manual 组)
+    if (config.hasManualGroup) {
+      result += `# ${config.name}地区手动聚合（手动选择，包含所有订阅）\n`
+      result += `${regionManualName} = select, ${regionSubGroupsManual.join(",")}, update-interval=0, no-alert=0, hidden=0, include-all-proxies=0\n`
+    }
+
+    // 保存该地区的所有组列表
+    regionAllGroupsMap[regionKey] = regionAllGroups
+  }
+
+  // 构建 Vibe-Coding 列表 (按照优化的顺序：聚合在前，然后是细分)
+  const vibeCodingFinal: string[] = []
+  // 遍历需要加入的地区 (US, SG)
+  // 这里我们按照 sortedRegions 的顺序来找
+  for (const [regionKey, config] of sortedRegions) {
+    if (config.includeInVibeGroup) {
+      // 先加聚合
+      vibeCodingFinal.push(`${config.emoji} ${config.name}节点`)
+      if (config.hasManualGroup) {
+        vibeCodingFinal.push(`${config.emoji} ${config.name}-手动`)
+      }
+      // 再加细分
+      kSurgeConfig.forEach(([subName]) => {
+        vibeCodingFinal.push(`${config.emoji} ${config.name}-${subName}`)
+        // if (config.hasManualGroup) {
+        //   vibeCodingFinal.push(`${config.emoji} ${config.name}-${subName}-手动`) // 不再加入 Vibe-Coding
+        // }
+      })
     }
   }
-  
-  // 🎧 Vibe-Coding：开发 / 编码场景下常用的外网出海组合（只包含新加坡和美国）
-  if (vibeCodingGroups.length > 0) {
+
+
+  // 2. 生成 [Subscription] 全局策略组 & 全局聚合
+  const globalSubGroups: string[] = []
+
+  kSurgeConfig.forEach(([subName, subUrl]) => {
+    // 命名格式：☁️ SubName-所有节点 (紧凑)
+    const globalSubGroupName = `☁️ ${subName}-所有节点`
+    globalSubGroups.push(globalSubGroupName)
+
+    result += `# ${subName} 订阅-所有节点\n`
+    result += `${globalSubGroupName} = select, policy-path=${subUrl}, update-interval=0, no-alert=0, hidden=0, include-all-proxies=0\n`
+  })
+
+  // 生成全局聚合 "🚀 所有节点"
+  // 包含所有订阅的全局组
+  result += `\n# 所有节点（聚合所有订阅）\n`
+  result += `${allNodesName} = select, include-other-group="${globalSubGroups.join(",")}", update-interval=0, no-alert=0, hidden=0, include-all-proxies=0\n`
+
+  // 3. Vibe-Coding
+  if (vibeCodingFinal.length > 0) {
     result += "\n# > 组合策略组\n"
-    result += `# 🎧 Vibe-Coding：开发 / 编码场景下常用的外网出海组合（新加坡 + 美国）\n`
-    result += `🎧 Vibe-Coding = select, ${vibeCodingGroups.join(", ")}\n`
+    result += `# 🎧 Vibe-Coding：开发 / 编码场景下常用的外网出海组合（包含聚合与细分）\n`
+    result += `🎧 Vibe-Coding = select, ${vibeCodingFinal.join(", ")}\n`
   }
-  
-  // 最后构建 "🚀 所有节点" 策略组（放在最后，符合参考配置的顺序）
-  result += `\n# 所有节点（从订阅自动更新）\n`
-  result += `${allNodesName} = select, policy-path=${mainUrl}, update-interval=0, no-alert=0, hidden=0, include-all-proxies=0\n`
-  
-  // 业务分流策略组：基于规则名创建，使用统一的标准配置
+
+  // 4. 业务分流策略组
   result += "\n# > 业务分流策略组\n"
   const ruleKeys = Object.keys(kRuleSet)
   for (let item of ruleKeys) {
@@ -297,18 +417,17 @@ const _buildExternalProxyGroup = (forceExternal: boolean = false): string => {
     if (rule.type === "direct") {
       continue
     }
-    
-    // 使用 emoji + 业务名称作为策略组名称
+
     const groupName = rule.emoji ? `${rule.emoji} ${item}` : item
-    const groups = _buildStandardGroups(allNodesName, rule.excludeHKAndTW || false, true, undefined, undefined, item)
+    const groups = _buildStandardGroups(allNodesName, rule.excludeHKAndTW || false, true, regionAllGroupsMap, undefined, item)
     result += `${groupName} = select, ${groups.join(", ")}\n`
   }
-  
-  // ⚡ Final：兜底策略
+
+  // 5. Final
   result += "\n# > 最终策略\n"
-  const finalGroups = _buildStandardGroups(allNodesName, false, true, undefined, undefined, "__final__")
+  const finalGroups = _buildStandardGroups(allNodesName, false, true, regionAllGroupsMap, undefined, "__final__")
   result += `⚡ Final = select, ${finalGroups.join(", ")}\n\n`
-  
+
   return result
 }
 
@@ -321,7 +440,7 @@ const _buildExternalProxyGroup = (forceExternal: boolean = false): string => {
  */
 const _buildProxyGroup = (proxyNames: string[]): string => {
   let result = "[Proxy Group]\n"
-  
+
   // 解析节点模式（原有逻辑，始终使用此模式）
   result += "# > 基础策略组\n"
   result += "# 🚀 所有节点：全局代理选择（手动选择单个节点）\n"
@@ -329,10 +448,10 @@ const _buildProxyGroup = (proxyNames: string[]): string => {
 
   // 所有节点按照地区做一次统一分桶，后续各类策略组（外网 / 业务）统一复用
   const regionBuckets = _bucketProxyByRegion(proxyNames)
-  
+
   // 按配置顺序生成地区策略组
   const sortedRegions = Object.entries(kRegionConfig).sort((a, b) => a[1].order - b[1].order)
-  const regionGroupNames: Record<string, { auto?: string, manual?: string }> = {}
+  const regionGroupNames: Record<string, string[]> = {}
   const vibeCodingGroups: string[] = []
 
   if (proxyNames.length > 0) {
@@ -345,10 +464,11 @@ const _buildProxyGroup = (proxyNames: string[]): string => {
       const autoGroupName = `${config.emoji} ${config.name}节点`
       result += `# ${config.name}地区自动选择（url-test，每 600 秒测试一次，选择延迟最低的节点）\n`
       result += `${autoGroupName} = url-test, ${nodes.join(", ")}, url=http://www.gstatic.com/generate_204, interval=600, tolerance=100, timeout=5\n`
-      regionGroupNames[regionKey] = { auto: autoGroupName }
-      
+      if (!regionGroupNames[regionKey]) regionGroupNames[regionKey] = []
+      regionGroupNames[regionKey].push(autoGroupName)
+
       // 只有新加坡和美国添加到 Vibe-Coding
-      if (regionKey === "sg" || regionKey === "us") {
+      if (config.includeInVibeGroup) {
         vibeCodingGroups.push(autoGroupName)
       }
 
@@ -357,10 +477,10 @@ const _buildProxyGroup = (proxyNames: string[]): string => {
         const manualGroupName = `${config.emoji} ${config.name}-手动`
         result += `# ${config.name}地区手动选择\n`
         result += `${manualGroupName} = select, ${nodes.join(", ")}\n`
-        regionGroupNames[regionKey].manual = manualGroupName
-        
+        regionGroupNames[regionKey].push(manualGroupName)
+
         // 只有新加坡和美国的手动策略组添加到 Vibe-Coding
-        if (regionKey === "sg" || regionKey === "us") {
+        if (config.includeInVibeGroup) {
           vibeCodingGroups.push(manualGroupName)
         }
       }
@@ -434,7 +554,7 @@ const _buildRules = (): string => {
   for (let [name, value] of Object.entries(kRuleSet)) {
     // 使用 emoji + 业务名称作为策略组名称（如果配置了 emoji）
     const groupName = value.emoji ? `${value.emoji} ${name}` : name
-    
+
     for (let url of value.url) {
       if (value.type === "direct") {
         result += `RULE-SET, ${url}, 🌐 全球直连\n`
@@ -450,7 +570,7 @@ const _buildRules = (): string => {
   // 4. 追加其余基础规则（例如 FINAL）
   result += "\n# > 基础规则\n"
   result += kRules.join("\n") + "\n"
-  
+
   result += "\n"
   return result
 }
@@ -475,7 +595,7 @@ const _buildDNS = (): string => {
  */
 const _buildBothProxyGroup = (): string => {
   let result = "[Proxy Group]\n"
-  
+
   // 构建外部节点策略组
   const externalGroups = _buildExternalProxyGroup(true)
   if (externalGroups) {
@@ -484,7 +604,7 @@ const _buildBothProxyGroup = (): string => {
     // 如果没有配置外部节点，返回基础配置
     result += "⚡ Final = select, 🌐 全球直连\n\n"
   }
-  
+
   return result
 }
 
@@ -504,20 +624,20 @@ app.get('/surge.conf', async (c: any) => {
   // 构建 Proxy 段并合并扩展配置
   let proxyContent = _buildProxy(proxy).replace("[Proxy]\n", "")
   r += "[Proxy]\n" + _extendedConfig.mergeProxy(proxyContent) + "\n"
-  
+
   // 构建 Proxy Group 段并合并扩展配置
   let proxyNames = proxy.map((x) => x[0])
   let proxyGroupContent = _buildProxyGroup(proxyNames).replace("[Proxy Group]\n", "")
   r += "[Proxy Group]\n" + _extendedConfig.mergeProxyGroup(proxyGroupContent) + "\n"
-  
+
   // 构建 Rule 段并合并扩展配置
   let ruleContent = _buildRules().replace("[Rule]\n", "")
   r += "[Rule]\n" + _extendedConfig.mergeRule(ruleContent) + "\n"
-  
+
   // 构建 Host 段并合并扩展配置
   let hostContent = _buildDNS().replace("[Host]\n", "")
   r += _extendedConfig.mergeHost(hostContent)
-  
+
   return c.text(r);
 })
 
@@ -543,20 +663,20 @@ app.get('/surge_ios.conf', async (c: any) => {
   // 构建 Proxy 段并合并扩展配置
   let proxyContent = _buildProxy(proxy).replace("[Proxy]\n", "")
   r += "[Proxy]\n" + _extendedConfig.mergeProxy(proxyContent) + "\n"
-  
+
   // 构建 Proxy Group 段并合并扩展配置
   let proxyNames = proxy.map((x) => x[0])
   let proxyGroupContent = _buildProxyGroup(proxyNames).replace("[Proxy Group]\n", "")
   r += "[Proxy Group]\n" + _extendedConfig.mergeProxyGroup(proxyGroupContent) + "\n"
-  
+
   // 构建 Rule 段并合并扩展配置
   let ruleContent = _buildRules().replace("[Rule]\n", "")
   r += "[Rule]\n" + _extendedConfig.mergeRule(ruleContent) + "\n"
-  
+
   // 构建 Host 段并合并扩展配置
   let hostContent = _buildDNS().replace("[Host]\n", "")
   r += _extendedConfig.mergeHost(hostContent)
-  
+
   return c.text(r);
 })
 
@@ -586,7 +706,7 @@ const _extendedConfig = {
     if (!extended) {
       return mainContent
     }
-    
+
     let result = mainContent
     if (comment) {
       result += `\n\n# ========== ${comment} ==========\n`
@@ -633,21 +753,21 @@ const _extendedConfig = {
  */
 const _buildExtendedConfig = (baseConfig: string): string => {
   let extended = baseConfig.trim()
-  
+
   // 如果定义了扩展配置，追加到配置末尾
   if (Object.keys(kExtendedConfig).length > 0) {
     extended += "\n\n# ========== 扩展配置 ==========\n"
-    
+
     // 按配置段顺序追加
     const sectionOrder = ["Proxy", "Proxy Group", "Rule", "Host"]
-    
+
     for (const section of sectionOrder) {
       const content = _extendedConfig.get(section)
       if (content) {
         extended += `\n[${section}]\n${content}\n`
       }
     }
-    
+
     // 处理其他未在标准顺序中的配置段
     for (const [section, content] of Object.entries(kExtendedConfig)) {
       if (!sectionOrder.includes(section) && content && content.trim()) {
@@ -655,7 +775,7 @@ const _buildExtendedConfig = (baseConfig: string): string => {
       }
     }
   }
-  
+
   return extended
 }
 
@@ -671,7 +791,7 @@ app.get('/surge_extended.conf', async (c: any) => {
   baseConfig += "# 注意：由于是托管配置，手动添加的内容在配置更新时可能会被覆盖\n"
   baseConfig += "# 建议将自定义配置添加到 src/config.ts 的 kExtendedConfig 中\n"
   baseConfig += "# ====================================\n\n"
-  
+
   baseConfig += _buildSetting(kSettingMac)
   let configs = await downloadConfigs()
   let proxy: Array<[string, string]> = []
@@ -686,7 +806,7 @@ app.get('/surge_extended.conf', async (c: any) => {
   baseConfig += _buildProxyGroup(proxyNames)
   baseConfig += _buildRules()
   baseConfig += _buildDNS()
-  
+
   // 添加扩展配置区域（用户可以在 Surge 客户端中编辑）
   baseConfig += "\n# ========== 自定义配置区域 ==========\n"
   baseConfig += "# 以下区域可以添加自定义配置，这些配置会与主配置合并\n"
@@ -696,7 +816,7 @@ app.get('/surge_extended.conf', async (c: any) => {
   baseConfig += "# - [Rule]：添加自定义规则\n"
   baseConfig += "# - [Host]：添加自定义域名解析\n"
   baseConfig += "# ====================================\n\n"
-  
+
   // 如果代码中定义了扩展配置，添加进去
   const extendedConfig = _buildExtendedConfig(baseConfig)
   return c.text(extendedConfig);
@@ -714,7 +834,7 @@ app.get('/surge_ios_extended.conf', async (c: any) => {
   baseConfig += "# 注意：由于是托管配置，手动添加的内容在配置更新时可能会被覆盖\n"
   baseConfig += "# 建议将自定义配置添加到 src/config.ts 的 kExtendedConfig 中\n"
   baseConfig += "# ====================================\n\n"
-  
+
   baseConfig += _buildSetting(kSettingIOS)
   let configs = await downloadConfigs()
   let proxy: Array<[string, string]> = []
@@ -733,7 +853,7 @@ app.get('/surge_ios_extended.conf', async (c: any) => {
   baseConfig += _buildProxyGroup(proxyNames)
   baseConfig += _buildRules()
   baseConfig += _buildDNS()
-  
+
   // 添加扩展配置区域（用户可以在 Surge 客户端中编辑）
   baseConfig += "\n# ========== 自定义配置区域 ==========\n"
   baseConfig += "# 以下区域可以添加自定义配置，这些配置会与主配置合并\n"
@@ -743,7 +863,7 @@ app.get('/surge_ios_extended.conf', async (c: any) => {
   baseConfig += "# - [Rule]：添加自定义规则\n"
   baseConfig += "# - [Host]：添加自定义域名解析\n"
   baseConfig += "# ====================================\n\n"
-  
+
   // 如果代码中定义了扩展配置，添加进去
   const extendedConfig = _buildExtendedConfig(baseConfig)
   return c.text(extendedConfig);
@@ -757,26 +877,26 @@ app.get('/surge_both.conf', async (c: any) => {
     console.error(`[错误] /surge_both.conf 未配置订阅`)
     return c.text("# 错误：未配置订阅，请在 src/config.ts 中配置 kSurgeConfig（第一个配置将用于外部节点模式）", 400)
   }
-  
+
   let r = `#!MANAGED-CONFIG http://${env.HOSTNAME}:${env.PORT}/surge_both.conf interval=43200 tag=Mac-Surge6-Smart-v1\n`
   r += "# app-version = Surge6\n"
   r += "# 此配置使用外部节点模式（smart 策略组），支持自动更新\n"
   r += _buildSetting(kSettingMac)
-  
+
   // 外部节点模式不需要下载和解析节点，直接使用 policy-path
   r += "[Proxy]\n"
   let proxyContent = "🌐 全球直连 = direct"
   r += _extendedConfig.mergeProxy(proxyContent) + "\n\n"
-  
+
   let proxyGroupContent = _buildBothProxyGroup().replace("[Proxy Group]\n", "")
   r += "[Proxy Group]\n" + _extendedConfig.mergeProxyGroup(proxyGroupContent) + "\n"
-  
+
   let ruleContent = _buildRules().replace("[Rule]\n", "")
   r += "[Rule]\n" + _extendedConfig.mergeRule(ruleContent) + "\n"
-  
+
   let hostContent = _buildDNS().replace("[Host]\n", "")
   r += _extendedConfig.mergeHost(hostContent)
-  
+
   return c.text(r);
 })
 
@@ -788,49 +908,73 @@ app.get('/surge_ios_both.conf', async (c: any) => {
     console.error(`[错误] /surge_ios_both.conf 未配置订阅`)
     return c.text("# 错误：未配置订阅，请在 src/config.ts 中配置 kSurgeConfig（第一个配置将用于外部节点模式）", 400)
   }
-  
+
   let r = `#!MANAGED-CONFIG http://${env.HOSTNAME}:${env.PORT}/surge_ios_both.conf interval=43200 tag=iOS-Surge5-Smart-v1\n`
   r += "# app-version = Surge5\n"
   r += "# 此配置使用外部节点模式（smart 策略组），支持自动更新\n"
   r += "# 节点通过 policy-path 自动从订阅更新，无需重新生成配置\n"
   r += _buildSetting(kSettingIOS)
-  
+
   // 外部节点模式不需要下载和解析节点，直接使用 policy-path
   r += "[Proxy]\n"
   // 为 iOS 客户端增加一个指向家庭网关 Mac 的代理
   const gatewayHost = getHostFromRequest(c)
   let proxyContent = `🌐 全球直连 = direct\nHome-Gateway = http, ${gatewayHost}, ${kGatewayHttpPort}`
   r += _extendedConfig.mergeProxy(proxyContent) + "\n\n"
-  
+
   let proxyGroupContent = _buildBothProxyGroup().replace("[Proxy Group]\n", "")
   r += "[Proxy Group]\n" + _extendedConfig.mergeProxyGroup(proxyGroupContent) + "\n"
-  
+
   let ruleContent = _buildRules().replace("[Rule]\n", "")
   r += "[Rule]\n" + _extendedConfig.mergeRule(ruleContent) + "\n"
-  
+
   let hostContent = _buildDNS().replace("[Host]\n", "")
   r += _extendedConfig.mergeHost(hostContent)
-  
+
   return c.text(r);
 })
 
 const port = parseInt(env.PORT || '3000')
 const hostname = env.HOSTNAME || '0.0.0.0'
 
+// 获取局域网 IP
+import { networkInterfaces } from 'os'
+const getLanIP = (): string | undefined => {
+  const nets = networkInterfaces()
+  for (const name of ['en0', 'en1', 'eth0', 'wlan0']) {
+    const net = nets[name]?.find(n => 
+      n.family === 'IPv4' && 
+      !n.internal && 
+      !n.address.startsWith('169.254.')  // 跳过 APIPA 地址
+    )
+    if (net) return net.address
+  }
+  return undefined
+}
+const lanIP = getLanIP()
+const localHost = '127.0.0.1'
+
 console.log(`\n🚀 Surge 配置生成服务启动成功`)
-console.log(`📡 监听地址: http://${hostname}:${port}`)
-console.log(`\n📋 可用端点:`)
-console.log(`\n   📱 解析节点模式（从订阅下载并解析节点）:`)
-console.log(`      - http://${hostname}:${port}/surge.conf (Mac - Surge 6)`)
-console.log(`      - http://${hostname}:${port}/surge_ios.conf (iOS - Surge 5)`)
+console.log(`📡 监听地址: ${hostname}:${port}`)
+
+console.log(`\n📋 可用端点 (本机访问):`)
+console.log(`   http://${localHost}:${port}/profile/mac`)
+console.log(`   http://${localHost}:${port}/profile/ios`)
+console.log(`   http://${localHost}:${port}/provider/mac`)
+console.log(`   http://${localHost}:${port}/provider/ios`)
+
+if (lanIP) {
+  console.log(`\n📋 可用端点 (局域网访问):`)
+  console.log(`   http://${lanIP}:${port}/profile/mac`)
+  console.log(`   http://${lanIP}:${port}/profile/ios`)
+  console.log(`   http://${lanIP}:${port}/provider/mac`)
+  console.log(`   http://${lanIP}:${port}/provider/ios`)
+}
+
 if (kSurgeConfig.length > 0) {
-  console.log(`\n   ⚡ 外部节点模式（smart 策略组，支持自动更新）:`)
-  console.log(`      - http://${hostname}:${port}/surge_both.conf (Mac - Surge 6)`)
-  console.log(`      - http://${hostname}:${port}/surge_ios_both.conf (iOS - Surge 5)`)
-  console.log(`      ✅ 订阅已配置: ${kSurgeConfig.length} 个（外部节点模式使用第一个配置）`)
+  console.log(`\n✅ 已配置 ${kSurgeConfig.length} 个订阅源`)
 } else {
-  console.log(`\n   ⚠️  订阅未配置`)
-  console.log(`      在 src/config.ts 中配置 kSurgeConfig 以启用所有端点`)
+  console.log(`\n⚠️  订阅未配置，请在 src/secrets.ts 中配置 kSubscriptions`)
 }
 console.log(`\n`)
 

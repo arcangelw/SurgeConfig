@@ -4,43 +4,45 @@
  * 聚合所有配置模块，提供统一的导入入口
  */
 
-// 地区配置
-export { kRegionConfig } from './regions';
-export type { RegionConfig } from './regions';
+export * from './types';
+export * from './constants';
+export * from './general';
+export * from './classification'; // Replaces regions
+export * from './rule-sets';      // Replaces rulesets
+export * from './rules';          // Preserved
 
-// 规则集配置
-export { kRuleSet } from './rulesets';
-export type { RuleSetConfig } from './rulesets';
+// 从 secrets.ts 导出用户配置
+import { 
+  kSubscriptions, 
+  kCompanyConfig, 
+  kCustomRules,
+  kCustomGroups,
+  kCustomHosts
+} from '../secrets';
 
-// 基础设置
 export {
-  kSettingMac,
-  kSettingIOS,
-  kGatewayHttpPort,
-  kGatewaySocksPort,
-} from './settings';
+  kSubscriptions,
+  kCompanyConfig,
+  kCustomRules,
+  kCustomGroups,
+  kCustomHosts
+};
 
-// 规则配置
-export {
-  kLanConfig,
-  kLocalLanRules,
-  kRules,
-} from './rules';
+// 兼容性导出 (Refactoring Shims) - 暂时保留以防未修改的引用报错
+import { getGeneralConfig } from './general';
+import { Platform } from './types';
+import { CLASSIFICATION_STRATEGY } from './classification';
+import { RULE_SETS } from './rule-sets';
+import { PORTS } from './constants';
 
-// DNS 配置
-export { kDNS } from './dns';
+export const kSettingMac = getGeneralConfig(Platform.MAC);
+export const kSettingIOS = getGeneralConfig(Platform.IOS);
+export const kRegionConfig = CLASSIFICATION_STRATEGY;
+export const kRuleSet = RULE_SETS;
+export const kGatewayHttpPort = PORTS.GATEWAY_HTTP;
+export const kGatewaySocksPort = PORTS.GATEWAY_SOCKS;
 
-// 敏感配置（从 secrets.ts 导入）
-import { kSubscriptions, kCompanyConfig, kSecretCustomRules, kSecretExtendedConfig } from '../secrets';
-
-/** 订阅配置 */
 export const kSurgeConfig = kSubscriptions;
-
-/** 公司配置 */
-export { kCompanyConfig };
-
-/** 自定义规则 */
-export const kCustomRules = kSecretCustomRules;
-
-/** 扩展配置（敏感） */
-export const kExtendedConfig = kSecretExtendedConfig;
+export const kDNS = kCustomHosts;
+export const kSecretCustomRules = kCustomRules;
+export const kExtendedConfig = kCustomGroups;

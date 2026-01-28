@@ -1,41 +1,13 @@
 /**
- * config/regions.ts - 地区配置
+ * config/classification.ts - 节点分类策略
  * 
- * 定义各个地区的识别规则和策略组生成规则
+ * 定义如何根据节点名称进行分组（正则、Emoji等）
+ * 仅包含静态策略数据，不含逻辑。
  */
 
-/**
- * 地区配置类型定义
- */
-export interface RegionConfig {
-  /** 地区显示名称 */
-  name: string;
-  /** Emoji 标识 */
-  emoji: string;
-  /** 节点名称匹配规则 */
-  matchPatterns: string[];
-  /** 正则过滤器（用于 policy-regex-filter） */
-  regexFilter: string;
-  /** 是否生成手动策略组 */
-  hasManualGroup?: boolean;
-  /** 是否只生成手动策略组 */
-  onlyManual?: boolean;
-  /** 是否加入 Vibe-Coding 组合策略组 */
-  includeInVibeGroup?: boolean;
-  /** 是否在 excludeHKAndTW 时排除此地区 */
-  excludeOnHKAndTW?: boolean;
-  /** 是否为核心地区 */
-  isCore?: boolean;
-  /** 显示顺序（数字越小越靠前） */
-  order: number;
-}
+import { RegionConfig } from './types';
 
-/**
- * 地区配置
- * - 核心地区（智能 + 手动策略组）
- * - 其他地区（合并为单一手动选择组）
- */
-export const kRegionConfig: Record<string, RegionConfig> = {
+export const CLASSIFICATION_STRATEGY: Record<string, RegionConfig> = {
   // ========== 核心地区 ==========
   us: {
     name: "美国",

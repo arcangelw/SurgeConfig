@@ -1,30 +1,12 @@
 /**
- * config/rulesets.ts - 规则集配置
+ * config/rule-sets.ts - 规则集定义
  * 
- * 定义各个逻辑业务分类对应的 RULE-SET 列表
+ * 定义引用自外部的规则集列表 (blackmatrix7)
  */
 
-/**
- * 规则集类型定义
- */
-export interface RuleSetConfig {
-  /** 规则集 URL 列表 */
-  url: string[];
-  /** 规则类型：proxy 走代理，direct 直连 */
-  type: "proxy" | "direct";
-  /** 业务 emoji 标识 */
-  emoji?: string;
-  /** 是否排除香港和台湾节点 */
-  excludeHKAndTW?: boolean;
-  /** 策略组优化模式 */
-  optimizeGroup?: "ai" | "apple";
-}
+import { RuleSetConfig } from './types';
 
-/**
- * 规则集配置
- * - 全部来自 blackmatrix7 仓库
- */
-export const kRuleSet: Record<string, RuleSetConfig> = {
+export const RULE_SETS: Record<string, RuleSetConfig> = {
   Apple: {
     url: ["https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Apple/Apple_All.list"],
     type: "proxy",
